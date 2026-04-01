@@ -4,7 +4,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from openai import OpenAI
@@ -136,6 +136,13 @@ def conversation_exists(conversation_id: int) -> bool:
             (conversation_id,),
         ).fetchone()
         return row is not None
+
+
+def delete_conversation(conversation_id: int) -> None:
+    """删除会话及其全部消息。"""
+    with get_conn() as conn:
+        conn.execute("DELETE FROM messages WHERE conversation_id = ?", (conversation_id,))
+        conn.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
 
 
 def get_messages(conversation_id: int) -> list[dict[str, Any]]:
@@ -280,8 +287,17 @@ def conversation_messages(conversation_id: int):
     return {"conversation_id": conversation_id, "messages": get_messages(conversation_id)}
 
 
+@app.delete("/conversations/{conversation_id}")
+def remove_conversation(conversation_id: int):
+    """删除指定会话。"""
+    if not conversation_exists(conversation_id):
+        raise HTTPException(status_code=404, detail="conversation not found")
+    delete_conversation(conversation_id)
+    return {"deleted": True, "conversation_id": conversation_id}
+
+
 @app.post("/chat/stream")
-async def chat_stream(payload: ChatRequest):
+async def chat_stream(payload: ChatRequest, request: Request):
     """处理用户消息并以 SSE 流式返回助手回复。"""
     conversation_id = payload.conversation_id
 
@@ -310,8 +326,9 @@ async def chat_stream(payload: ChatRequest):
         for item in get_messages(conversation_id)
     ]
 
-    def event_stream():
+    async def event_stream():
         answer_parts: list[str] = []
+        stream = None
         try:
             stream = client.chat.completions.create(
                 model="deepseek-chat",
@@ -319,6 +336,8 @@ async def chat_stream(payload: ChatRequest):
                 stream=True,
             )
             for chunk in stream:
+                if await request.is_disconnected():
+                    break
                 delta = chunk.choices[0].delta.content if chunk.choices else None
                 if not delta:
                     continue
@@ -326,11 +345,20 @@ async def chat_stream(payload: ChatRequest):
                 yield f"data: {json.dumps({'type': 'delta', 'content': delta}, ensure_ascii=False)}\n\n"
 
             answer = "".join(answer_parts)
-            save_message(conversation_id, "assistant", answer)
-            yield f"data: {json.dumps({'type': 'done', 'conversation_id': conversation_id}, ensure_ascii=False)}\n\n"
+            if answer:
+                save_message(conversation_id, "assistant", answer)
+            if not await request.is_disconnected():
+                yield f"data: {json.dumps({'type': 'done', 'conversation_id': conversation_id}, ensure_ascii=False)}\n\n"
         except Exception as exc:
-            message = str(exc) or "stream failed"
-            yield f"data: {json.dumps({'type': 'error', 'message': message}, ensure_ascii=False)}\n\n"
+            if answer_parts:
+                save_message(conversation_id, "assistant", "".join(answer_parts))
+            if not await request.is_disconnected():
+                message = str(exc) or "stream failed"
+                yield f"data: {json.dumps({'type': 'error', 'message': message}, ensure_ascii=False)}\n\n"
+        finally:
+            close = getattr(stream, "close", None)
+            if callable(close):
+                close()
 
     return StreamingResponse(
         event_stream(),
