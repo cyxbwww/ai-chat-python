@@ -232,7 +232,7 @@ def list_conversations() -> list[dict[str, Any]]:
 def on_startup() -> None:
     """服务启动时初始化数据库。"""
     init_db()
-    clear_db()
+    # clear_db()
 
 
 @app.get("/")
