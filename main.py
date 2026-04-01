@@ -1,10 +1,12 @@
-﻿import sqlite3
+import json
 import os
+import sqlite3
 from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from openai import OpenAI
 from pydantic import BaseModel
 
@@ -66,7 +68,7 @@ DB_PATH = BASE_DIR / "chat_history.db"
 
 
 class ChatRequest(BaseModel):
-    """/chat 接口请求体。"""
+    """/chat/stream 接口请求体。"""
 
     conversation_id: int | None = None
     content: str | None = None
@@ -108,17 +110,12 @@ def init_db() -> None:
             """
         )
 
-        # 兼容旧库：如果没有 updated_at 字段则补上并回填。
-        columns = conn.execute("PRAGMA table_info(conversations)").fetchall()
-        names = {str(row["name"]) for row in columns}
-        if "updated_at" not in names:
-            conn.execute("ALTER TABLE conversations ADD COLUMN updated_at DATETIME")
-            conn.execute(
-                """
-                UPDATE conversations
-                SET updated_at = COALESCE(updated_at, created_at, CURRENT_TIMESTAMP)
-                """
-            )
+def clear_db() -> None:
+    """清空会话与消息数据，并重置自增序列。"""
+    with get_conn() as conn:
+        conn.execute("DELETE FROM messages")
+        conn.execute("DELETE FROM conversations")
+        conn.execute("DELETE FROM sqlite_sequence WHERE name IN ('messages', 'conversations')")
 
 
 def create_conversation(title: str | None = None) -> int:
@@ -228,6 +225,7 @@ def list_conversations() -> list[dict[str, Any]]:
 def on_startup() -> None:
     """服务启动时初始化数据库。"""
     init_db()
+    clear_db()
 
 
 @app.get("/")
@@ -282,9 +280,9 @@ def conversation_messages(conversation_id: int):
     return {"conversation_id": conversation_id, "messages": get_messages(conversation_id)}
 
 
-@app.post("/chat")
-async def chat(payload: ChatRequest):
-    """处理用户消息、调用模型并保存双向消息。"""
+@app.post("/chat/stream")
+async def chat_stream(payload: ChatRequest):
+    """处理用户消息并以 SSE 流式返回助手回复。"""
     conversation_id = payload.conversation_id
 
     # 解析目标会话（无会话则新建）。
@@ -312,19 +310,34 @@ async def chat(payload: ChatRequest):
         for item in get_messages(conversation_id)
     ]
 
-    # 调用模型生成回复。
-    resp = client.chat.completions.create(
-        model="deepseek-chat",
-        messages=history,
+    def event_stream():
+        answer_parts: list[str] = []
+        try:
+            stream = client.chat.completions.create(
+                model="deepseek-chat",
+                messages=history,
+                stream=True,
+            )
+            for chunk in stream:
+                delta = chunk.choices[0].delta.content if chunk.choices else None
+                if not delta:
+                    continue
+                answer_parts.append(delta)
+                yield f"data: {json.dumps({'type': 'delta', 'content': delta}, ensure_ascii=False)}\n\n"
+
+            answer = "".join(answer_parts)
+            save_message(conversation_id, "assistant", answer)
+            yield f"data: {json.dumps({'type': 'done', 'conversation_id': conversation_id}, ensure_ascii=False)}\n\n"
+        except Exception as exc:
+            message = str(exc) or "stream failed"
+            yield f"data: {json.dumps({'type': 'error', 'message': message}, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
     )
-
-    # 保存助手回复并返回前端。
-    answer = resp.choices[0].message.content or ""
-    save_message(conversation_id, "assistant", answer)
-
-    return {
-        "conversation_id": conversation_id,
-        "answer": answer,
-    }
-
-
