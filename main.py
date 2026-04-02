@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -78,6 +79,12 @@ SYSTEM_PROMPT_PRESETS = {
     "translation": "你是一名翻译助手。请准确翻译并保留原意与语气；如有歧义，给出更自然的候选译法。",
 }
 
+MARKDOWN_OUTPUT_INSTRUCTION = (
+    "请直接输出 Markdown，不要用 ```markdown 或 ```text 包裹整段回复；"
+    "仅在需要展示代码时使用代码块。"
+)
+NON_CODE_FENCE_LANGS = {"", "markdown", "md", "mdown", "mkd", "text", "txt", "plain", "plaintext"}
+
 
 class ChatRequest(BaseModel):
     """/chat/stream 接口请求体。"""
@@ -91,6 +98,40 @@ class ChatRequest(BaseModel):
 
 
 CONTINUATION_PROMPT = "请从你上一条回答中断的位置继续，不要重复前文内容。"
+
+
+def _likely_code(text: str) -> bool:
+    return bool(
+        re.search(
+            r"(^|\n)\s{0,3}(const|let|var|function|class|import|export|if|for|while|return|def|public|private)\b|=>|[;{}()]|</?[a-z][^>]*>",
+            text,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def _should_unwrap_fence(lang: str, body: str) -> bool:
+    normalized_lang = (lang or "").strip().lower()
+    if normalized_lang in NON_CODE_FENCE_LANGS:
+        if normalized_lang:
+            return True
+        return not _likely_code(body)
+    return False
+
+
+def unwrap_pseudo_markdown_fence(text: str) -> str:
+    normalized = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    if not normalized:
+        return text or ""
+
+    def _replace(match: re.Match[str]) -> str:
+        lang = (match.group(1) or "").strip().lower()
+        body = match.group(2)
+        if not _should_unwrap_fence(lang, body):
+            return match.group(0)
+        return body.rstrip()
+
+    return re.sub(r"```([^\n`]*)\n([\s\S]*?)\n```", _replace, normalized)
 
 
 def get_conn() -> sqlite3.Connection:
@@ -413,6 +454,10 @@ async def chat_stream(payload: ChatRequest, request: Request):
         preset = (payload.system_prompt_preset or "").strip()
         if preset:
             system_prompt = SYSTEM_PROMPT_PRESETS.get(preset, "")
+    if system_prompt:
+        system_prompt = f"{system_prompt}\n\n{MARKDOWN_OUTPUT_INSTRUCTION}"
+    else:
+        system_prompt = MARKDOWN_OUTPUT_INSTRUCTION
     history = [
         {"role": item["role"], "content": item["content"]}
         for item in get_messages(conversation_id)
@@ -448,7 +493,7 @@ async def chat_stream(payload: ChatRequest, request: Request):
                 answer_parts.append(delta)
                 yield f"data: {json.dumps({'type': 'delta', 'content': delta}, ensure_ascii=False)}\n\n"
 
-            answer = "".join(answer_parts)
+            answer = unwrap_pseudo_markdown_fence("".join(answer_parts))
             if answer:
                 save_message(conversation_id, "assistant", answer)
             if not await request.is_disconnected():
@@ -468,7 +513,8 @@ async def chat_stream(payload: ChatRequest, request: Request):
                 )
         except Exception as exc:
             if answer_parts:
-                save_message(conversation_id, "assistant", "".join(answer_parts))
+                partial_answer = unwrap_pseudo_markdown_fence("".join(answer_parts))
+                save_message(conversation_id, "assistant", partial_answer)
             if not await request.is_disconnected():
                 message = str(exc) or "stream failed"
                 yield f"data: {json.dumps({'type': 'error', 'message': message}, ensure_ascii=False)}\n\n"
