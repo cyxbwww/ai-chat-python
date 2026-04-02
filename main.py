@@ -66,6 +66,12 @@ client = OpenAI(
 # SQLite 数据库文件路径（放在后端目录下）。
 DB_PATH = BASE_DIR / "chat_history.db"
 
+# Token 预算配置（可通过环境变量覆盖）。
+MAX_CONTEXT_TOKENS = int(os.getenv("MAX_CONTEXT_TOKENS", "8192"))
+RESERVED_OUTPUT_TOKENS = int(os.getenv("RESERVED_OUTPUT_TOKENS", "1024"))
+TOKEN_CHARS_ESTIMATE = int(os.getenv("TOKEN_CHARS_ESTIMATE", "2"))
+MESSAGE_OVERHEAD_TOKENS = int(os.getenv("MESSAGE_OVERHEAD_TOKENS", "6"))
+
 
 class ChatRequest(BaseModel):
     """/chat/stream 接口请求体。"""
@@ -80,6 +86,55 @@ def get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def estimate_text_tokens(text: str) -> int:
+    """按字符数粗略估算 token 数。"""
+    normalized = text or ""
+    chars_per_token = max(1, TOKEN_CHARS_ESTIMATE)
+    return max(1, (len(normalized) + chars_per_token - 1) // chars_per_token)
+
+
+def truncate_text_to_token_budget(text: str, token_budget: int) -> str:
+    """把文本截断到给定 token 预算（保留尾部）。"""
+    if token_budget <= 0:
+        return ""
+    chars_per_token = max(1, TOKEN_CHARS_ESTIMATE)
+    max_chars = token_budget * chars_per_token
+    if len(text) <= max_chars:
+        return text
+    return text[-max_chars:]
+
+
+def build_context_messages(history: list[dict[str, Any]]) -> tuple[list[dict[str, str]], int]:
+    """按 token 预算裁剪历史消息，并预留输出 token。"""
+    max_context = max(256, MAX_CONTEXT_TOKENS)
+    reserved_output = max(1, min(RESERVED_OUTPUT_TOKENS, max_context - 1))
+    input_budget = max(1, max_context - reserved_output)
+
+    selected_reversed: list[dict[str, str]] = []
+    used_input_tokens = 0
+    per_message_overhead = max(1, MESSAGE_OVERHEAD_TOKENS)
+
+    # 从最近消息往前取，优先保留最新上下文。
+    for item in reversed(history):
+        role = str(item.get("role", "user"))
+        content = str(item.get("content", "") or "")
+        message_cost = per_message_overhead + estimate_text_tokens(content)
+
+        if used_input_tokens + message_cost <= input_budget:
+            selected_reversed.append({"role": role, "content": content})
+            used_input_tokens += message_cost
+            continue
+
+        # 即便单条消息超预算，也保留尾部，避免空上下文。
+        if not selected_reversed:
+            allowed = max(1, input_budget - per_message_overhead)
+            truncated = truncate_text_to_token_budget(content, allowed)
+            selected_reversed.append({"role": role, "content": truncated})
+        break
+
+    return list(reversed(selected_reversed)), reserved_output
 
 
 def init_db() -> None:
@@ -325,6 +380,7 @@ async def chat_stream(payload: ChatRequest, request: Request):
         {"role": item["role"], "content": item["content"]}
         for item in get_messages(conversation_id)
     ]
+    history, reserved_output_tokens = build_context_messages(history)
 
     async def event_stream():
         answer_parts: list[str] = []
@@ -333,6 +389,7 @@ async def chat_stream(payload: ChatRequest, request: Request):
             stream = client.chat.completions.create(
                 model="deepseek-chat",
                 messages=history,
+                max_tokens=reserved_output_tokens,
                 stream=True,
             )
             for chunk in stream:
