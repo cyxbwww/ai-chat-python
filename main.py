@@ -87,6 +87,10 @@ class ChatRequest(BaseModel):
     messages: list[dict[str, Any]] | None = None
     system_prompt: str | None = None
     system_prompt_preset: str | None = None
+    continue_from_last: bool = False
+
+
+CONTINUATION_PROMPT = "请从你上一条回答中断的位置继续，不要重复前文内容。"
 
 
 def get_conn() -> sqlite3.Connection:
@@ -379,6 +383,7 @@ def remove_conversation(conversation_id: int):
 async def chat_stream(payload: ChatRequest, request: Request):
     """处理用户消息并以 SSE 流式返回助手回复。"""
     conversation_id = payload.conversation_id
+    continue_from_last = bool(payload.continue_from_last)
 
     # 解析目标会话（无会话则新建）。
     if conversation_id is None:
@@ -393,11 +398,14 @@ async def chat_stream(payload: ChatRequest, request: Request):
         if user_messages:
             content = str(user_messages[-1].get("content", "")).strip()
 
-    if not content:
+    if continue_from_last and content:
+        raise HTTPException(status_code=400, detail="continue request should not include content")
+    if not continue_from_last and not content:
         raise HTTPException(status_code=400, detail="empty message")
 
-    # 先保存用户消息。
-    save_message(conversation_id, "user", content)
+    # 普通提问保存用户消息；续写请求不入库，仅作为临时指令拼接到上下文。
+    if not continue_from_last:
+        save_message(conversation_id, "user", content)
 
     # 组装历史上下文发送给模型。
     system_prompt = (payload.system_prompt or "").strip()
@@ -409,11 +417,16 @@ async def chat_stream(payload: ChatRequest, request: Request):
         {"role": item["role"], "content": item["content"]}
         for item in get_messages(conversation_id)
     ]
+    if continue_from_last:
+        if not history or history[-1]["role"] != "assistant":
+            raise HTTPException(status_code=400, detail="no assistant message to continue")
+        history.append({"role": "user", "content": CONTINUATION_PROMPT})
     history, reserved_output_tokens = build_context_messages(history, system_prompt=system_prompt)
 
     async def event_stream():
         answer_parts: list[str] = []
         stream = None
+        finish_reason: str | None = None
         try:
             stream = client.chat.completions.create(
                 model="deepseek-chat",
@@ -424,7 +437,12 @@ async def chat_stream(payload: ChatRequest, request: Request):
             for chunk in stream:
                 if await request.is_disconnected():
                     break
-                delta = chunk.choices[0].delta.content if chunk.choices else None
+                if not chunk.choices:
+                    continue
+                choice = chunk.choices[0]
+                if choice.finish_reason:
+                    finish_reason = str(choice.finish_reason)
+                delta = choice.delta.content
                 if not delta:
                     continue
                 answer_parts.append(delta)
@@ -434,7 +452,20 @@ async def chat_stream(payload: ChatRequest, request: Request):
             if answer:
                 save_message(conversation_id, "assistant", answer)
             if not await request.is_disconnected():
-                yield f"data: {json.dumps({'type': 'done', 'conversation_id': conversation_id}, ensure_ascii=False)}\n\n"
+                truncated = finish_reason == "length"
+                yield (
+                    "data: "
+                    + json.dumps(
+                        {
+                            "type": "done",
+                            "conversation_id": conversation_id,
+                            "finish_reason": finish_reason,
+                            "truncated": truncated,
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n\n"
+                )
         except Exception as exc:
             if answer_parts:
                 save_message(conversation_id, "assistant", "".join(answer_parts))
