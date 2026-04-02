@@ -68,9 +68,15 @@ DB_PATH = BASE_DIR / "chat_history.db"
 
 # Token 预算配置（可通过环境变量覆盖）。
 MAX_CONTEXT_TOKENS = int(os.getenv("MAX_CONTEXT_TOKENS", "8192"))
-RESERVED_OUTPUT_TOKENS = int(os.getenv("RESERVED_OUTPUT_TOKENS", "1024"))
+RESERVED_OUTPUT_TOKENS = int(os.getenv("RESERVED_OUTPUT_TOKENS", "2048"))
 TOKEN_CHARS_ESTIMATE = int(os.getenv("TOKEN_CHARS_ESTIMATE", "2"))
 MESSAGE_OVERHEAD_TOKENS = int(os.getenv("MESSAGE_OVERHEAD_TOKENS", "6"))
+SYSTEM_PROMPT_PRESETS = {
+    "general": "你是一个通用 AI 助手。请用中文回答，表达清晰、简洁，优先给出可执行建议。",
+    "coding": "你是一名资深编程助手。请用中文回答，先给可运行方案，再补充关键原理与边界条件，代码尽量简洁。",
+    "interview": "你是一名面试助手。请用中文回答，按“思路-要点-示例”结构给出答案，突出重点并提供可复述的表达。",
+    "translation": "你是一名翻译助手。请准确翻译并保留原意与语气；如有歧义，给出更自然的候选译法。",
+}
 
 
 class ChatRequest(BaseModel):
@@ -79,6 +85,8 @@ class ChatRequest(BaseModel):
     conversation_id: int | None = None
     content: str | None = None
     messages: list[dict[str, Any]] | None = None
+    system_prompt: str | None = None
+    system_prompt_preset: str | None = None
 
 
 def get_conn() -> sqlite3.Connection:
@@ -106,15 +114,27 @@ def truncate_text_to_token_budget(text: str, token_budget: int) -> str:
     return text[-max_chars:]
 
 
-def build_context_messages(history: list[dict[str, Any]]) -> tuple[list[dict[str, str]], int]:
+def build_context_messages(
+    history: list[dict[str, Any]], system_prompt: str = ""
+) -> tuple[list[dict[str, str]], int]:
     """按 token 预算裁剪历史消息，并预留输出 token。"""
     max_context = max(256, MAX_CONTEXT_TOKENS)
     reserved_output = max(1, min(RESERVED_OUTPUT_TOKENS, max_context - 1))
     input_budget = max(1, max_context - reserved_output)
 
     selected_reversed: list[dict[str, str]] = []
-    used_input_tokens = 0
     per_message_overhead = max(1, MESSAGE_OVERHEAD_TOKENS)
+    normalized_system_prompt = (system_prompt or "").strip()
+    used_input_tokens = 0
+
+    if normalized_system_prompt:
+        system_cost = per_message_overhead + estimate_text_tokens(normalized_system_prompt)
+        if system_cost <= input_budget:
+            used_input_tokens += system_cost
+        else:
+            allowed = max(1, input_budget - per_message_overhead)
+            normalized_system_prompt = truncate_text_to_token_budget(normalized_system_prompt, allowed)
+            used_input_tokens += per_message_overhead + estimate_text_tokens(normalized_system_prompt)
 
     # 从最近消息往前取，优先保留最新上下文。
     for item in reversed(history):
@@ -134,7 +154,11 @@ def build_context_messages(history: list[dict[str, Any]]) -> tuple[list[dict[str
             selected_reversed.append({"role": role, "content": truncated})
         break
 
-    return list(reversed(selected_reversed)), reserved_output
+    selected_messages = list(reversed(selected_reversed))
+    if normalized_system_prompt:
+        selected_messages.insert(0, {"role": "system", "content": normalized_system_prompt})
+
+    return selected_messages, reserved_output
 
 
 def init_db() -> None:
@@ -376,11 +400,16 @@ async def chat_stream(payload: ChatRequest, request: Request):
     save_message(conversation_id, "user", content)
 
     # 组装历史上下文发送给模型。
+    system_prompt = (payload.system_prompt or "").strip()
+    if not system_prompt:
+        preset = (payload.system_prompt_preset or "").strip()
+        if preset:
+            system_prompt = SYSTEM_PROMPT_PRESETS.get(preset, "")
     history = [
         {"role": item["role"], "content": item["content"]}
         for item in get_messages(conversation_id)
     ]
-    history, reserved_output_tokens = build_context_messages(history)
+    history, reserved_output_tokens = build_context_messages(history, system_prompt=system_prompt)
 
     async def event_stream():
         answer_parts: list[str] = []
