@@ -1,7 +1,6 @@
 import json
 import os
 import re
-import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -9,24 +8,33 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from openai import OpenAI
-from pydantic import BaseModel
 
-# 项目根目录路径。
+from db import (
+    conversation_exists,
+    create_conversation,
+    delete_conversation,
+    get_conn,
+    get_messages,
+    init_db,
+    list_conversations,
+    save_message,
+)
+from models import ChatRequest
+
+# 项目根目录。
 BASE_DIR = Path(__file__).resolve().parent
 
 
 def load_dotenv_file(dotenv_path: Path) -> None:
-    """加载 .env 文件到环境变量（不覆盖已有变量）。"""
+    """读取 .env 并注入环境变量（不覆盖已有变量）。"""
     if not dotenv_path.exists():
         return
 
     text = dotenv_path.read_text(encoding="utf-8")
     for raw_line in text.splitlines():
+        # 逐行清洗，忽略空行与注释行。
         line = raw_line.strip()
-        # 跳过空行和注释行。
-        if not line or line.startswith("#"):
-            continue
-        if "=" not in line:
+        if not line or line.startswith("#") or "=" not in line:
             continue
 
         key, value = line.split("=", 1)
@@ -35,16 +43,17 @@ def load_dotenv_file(dotenv_path: Path) -> None:
         if not key:
             continue
 
+        # 使用 setdefault，避免覆盖系统或容器注入值。
         os.environ.setdefault(key, value)
 
 
-# 启动时尝试读取同目录下 .env。
+# 启动时加载同目录 .env。
 load_dotenv_file(BASE_DIR / ".env")
 
-# FastAPI 应用实例。
+# 初始化 FastAPI 应用。
 app = FastAPI()
 
-# 允许前端跨域访问后端接口。
+# 开放跨域，便于前端本地开发直接调用。
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -53,25 +62,24 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# OpenAI 兼容客户端（当前接入 DeepSeek）。
-# 从环境变量读取密钥，避免把密钥写死在代码里。
+# 读取模型 API Key（优先 DEEPSEEK）。
 API_KEY = os.getenv("DEEPSEEK_API_KEY") or os.getenv("OPENAI_API_KEY")
 if not API_KEY:
-    raise RuntimeError("缺少 API Key，请设置环境变量 DEEPSEEK_API_KEY 或 OPENAI_API_KEY")
+    raise RuntimeError("Missing API key: set DEEPSEEK_API_KEY or OPENAI_API_KEY")
 
+# 初始化 OpenAI 兼容客户端。
 client = OpenAI(
     api_key=API_KEY,
     base_url="https://api.deepseek.com",
 )
 
-# SQLite 数据库文件路径（放在后端目录下）。
-DB_PATH = BASE_DIR / "chat_history.db"
-
-# Token 预算配置（可通过环境变量覆盖）。
+# 上下文 token 预算配置。
 MAX_CONTEXT_TOKENS = int(os.getenv("MAX_CONTEXT_TOKENS", "8192"))
 RESERVED_OUTPUT_TOKENS = int(os.getenv("RESERVED_OUTPUT_TOKENS", "2048"))
 TOKEN_CHARS_ESTIMATE = int(os.getenv("TOKEN_CHARS_ESTIMATE", "2"))
 MESSAGE_OVERHEAD_TOKENS = int(os.getenv("MESSAGE_OVERHEAD_TOKENS", "6"))
+
+# 系统提示词预设。
 SYSTEM_PROMPT_PRESETS = {
     "general": "你是一个通用 AI 助手。请用中文回答，表达清晰、简洁，优先给出可执行建议。",
     "coding": "你是一名资深编程助手。请用中文回答，先给可运行方案，再补充关键原理与边界条件，代码尽量简洁。",
@@ -79,28 +87,22 @@ SYSTEM_PROMPT_PRESETS = {
     "translation": "你是一名翻译助手。请准确翻译并保留原意与语气；如有歧义，给出更自然的候选译法。",
 }
 
+# 约束模型默认输出格式为 Markdown。
 MARKDOWN_OUTPUT_INSTRUCTION = (
     "请直接输出 Markdown，不要用 ```markdown 或 ```text 包裹整段回复；"
     "仅在需要展示代码时使用代码块。"
 )
+
+# 续写模式下追加的指令。
+CONTINUATION_PROMPT = "请从你上一条回答中断的位置继续，不要重复前文内容。"
+
+# 可视为“非代码”围栏语言集合。
 NON_CODE_FENCE_LANGS = {"", "markdown", "md", "mdown", "mkd", "text", "txt", "plain", "plaintext"}
 
 
-class ChatRequest(BaseModel):
-    """/chat/stream 接口请求体。"""
-
-    conversation_id: int | None = None
-    content: str | None = None
-    messages: list[dict[str, Any]] | None = None
-    system_prompt: str | None = None
-    system_prompt_preset: str | None = None
-    continue_from_last: bool = False
-
-
-CONTINUATION_PROMPT = "请从你上一条回答中断的位置继续，不要重复前文内容。"
-
-
 def _likely_code(text: str) -> bool:
+    """判断文本是否更像代码片段。"""
+    # 使用轻量关键词 + 语法符号启发式判断。
     return bool(
         re.search(
             r"(^|\n)\s{0,3}(const|let|var|function|class|import|export|if|for|while|return|def|public|private)\b|=>|[;{}()]|</?[a-z][^>]*>",
@@ -111,20 +113,25 @@ def _likely_code(text: str) -> bool:
 
 
 def _should_unwrap_fence(lang: str, body: str) -> bool:
+    """判断某个 Markdown 围栏是否应当解包。"""
     normalized_lang = (lang or "").strip().lower()
     if normalized_lang in NON_CODE_FENCE_LANGS:
+        # 显式标注 markdown/text 时直接解包。
         if normalized_lang:
             return True
+        # 未标注语言时，只有不像代码才解包。
         return not _likely_code(body)
     return False
 
 
 def unwrap_pseudo_markdown_fence(text: str) -> str:
+    """去掉伪 Markdown 围栏（如 ```markdown）。"""
     normalized = (text or "").replace("\r\n", "\n").replace("\r", "\n")
     if not normalized:
         return text or ""
 
     def _replace(match: re.Match[str]) -> str:
+        # 提取语言标记与正文，按规则决定是否解包。
         lang = (match.group(1) or "").strip().lower()
         body = match.group(2)
         if not _should_unwrap_fence(lang, body):
@@ -132,13 +139,6 @@ def unwrap_pseudo_markdown_fence(text: str) -> str:
         return body.rstrip()
 
     return re.sub(r"```([^\n`]*)\n([\s\S]*?)\n```", _replace, normalized)
-
-
-def get_conn() -> sqlite3.Connection:
-    """创建数据库连接，并支持按字段名访问行数据。"""
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
 
 
 def estimate_text_tokens(text: str) -> int:
@@ -149,39 +149,43 @@ def estimate_text_tokens(text: str) -> int:
 
 
 def truncate_text_to_token_budget(text: str, token_budget: int) -> str:
-    """把文本截断到给定 token 预算（保留尾部）。"""
+    """按 token 预算截断文本，优先保留尾部内容。"""
     if token_budget <= 0:
         return ""
     chars_per_token = max(1, TOKEN_CHARS_ESTIMATE)
     max_chars = token_budget * chars_per_token
     if len(text) <= max_chars:
         return text
+    # 对续写场景更有价值的是尾部上下文。
     return text[-max_chars:]
 
 
 def build_context_messages(
     history: list[dict[str, Any]], system_prompt: str = ""
 ) -> tuple[list[dict[str, str]], int]:
-    """按 token 预算裁剪历史消息，并预留输出 token。"""
+    """根据预算裁剪上下文，返回发送给模型的消息列表与输出预算。"""
+    # 拆分输入预算与输出预算。
     max_context = max(256, MAX_CONTEXT_TOKENS)
     reserved_output = max(1, min(RESERVED_OUTPUT_TOKENS, max_context - 1))
     input_budget = max(1, max_context - reserved_output)
+    per_message_overhead = max(1, MESSAGE_OVERHEAD_TOKENS)
 
     selected_reversed: list[dict[str, str]] = []
-    per_message_overhead = max(1, MESSAGE_OVERHEAD_TOKENS)
     normalized_system_prompt = (system_prompt or "").strip()
     used_input_tokens = 0
 
     if normalized_system_prompt:
+        # 先把系统提示词放入预算。
         system_cost = per_message_overhead + estimate_text_tokens(normalized_system_prompt)
         if system_cost <= input_budget:
             used_input_tokens += system_cost
         else:
+            # 系统提示词过长时按预算截断。
             allowed = max(1, input_budget - per_message_overhead)
             normalized_system_prompt = truncate_text_to_token_budget(normalized_system_prompt, allowed)
             used_input_tokens += per_message_overhead + estimate_text_tokens(normalized_system_prompt)
 
-    # 从最近消息往前取，优先保留最新上下文。
+    # 从最新消息向前选取，优先保留近邻语境。
     for item in reversed(history):
         role = str(item.get("role", "user"))
         content = str(item.get("content", "") or "")
@@ -192,7 +196,7 @@ def build_context_messages(
             used_input_tokens += message_cost
             continue
 
-        # 即便单条消息超预算，也保留尾部，避免空上下文。
+        # 即便超预算，也尽量保留一条裁剪后的最新消息。
         if not selected_reversed:
             allowed = max(1, input_budget - per_message_overhead)
             truncated = truncate_text_to_token_budget(content, allowed)
@@ -201,187 +205,44 @@ def build_context_messages(
 
     selected_messages = list(reversed(selected_reversed))
     if normalized_system_prompt:
+        # 系统提示词固定放在最前面。
         selected_messages.insert(0, {"role": "system", "content": normalized_system_prompt})
-
     return selected_messages, reserved_output
-
-
-def init_db() -> None:
-    """初始化数据库表，并执行轻量迁移。"""
-    with get_conn() as conn:
-        # 会话表。
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS conversations (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT,
-                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        )
-        # 消息表。
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                conversation_id INTEGER NOT NULL,
-                role TEXT NOT NULL,
-                content TEXT NOT NULL,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (conversation_id) REFERENCES conversations(id)
-            )
-            """
-        )
-
-def clear_db() -> None:
-    """清空会话与消息数据，并重置自增序列。"""
-    with get_conn() as conn:
-        conn.execute("DELETE FROM messages")
-        conn.execute("DELETE FROM conversations")
-        conn.execute("DELETE FROM sqlite_sequence WHERE name IN ('messages', 'conversations')")
-
-
-def create_conversation(title: str | None = None) -> int:
-    """新建会话并返回会话 ID。"""
-    with get_conn() as conn:
-        cur = conn.execute(
-            "INSERT INTO conversations(title) VALUES(?)",
-            (title,),
-        )
-        return int(cur.lastrowid)
-
-
-def conversation_exists(conversation_id: int) -> bool:
-    """检查会话是否存在。"""
-    with get_conn() as conn:
-        row = conn.execute(
-            "SELECT id FROM conversations WHERE id = ?",
-            (conversation_id,),
-        ).fetchone()
-        return row is not None
-
-
-def delete_conversation(conversation_id: int) -> None:
-    """删除会话及其全部消息。"""
-    with get_conn() as conn:
-        conn.execute("DELETE FROM messages WHERE conversation_id = ?", (conversation_id,))
-        conn.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
-
-
-def get_messages(conversation_id: int) -> list[dict[str, Any]]:
-    """读取一个会话下的全部消息（按时间正序）。"""
-    with get_conn() as conn:
-        rows = conn.execute(
-            """
-            SELECT id, role, content, created_at
-            FROM messages
-            WHERE conversation_id = ?
-            ORDER BY id ASC
-            """,
-            (conversation_id,),
-        ).fetchall()
-    return [dict(row) for row in rows]
-
-
-def save_message(conversation_id: int, role: str, content: str) -> None:
-    """保存单条消息，并维护会话元信息。"""
-    with get_conn() as conn:
-        # 保存消息正文。
-        conn.execute(
-            """
-            INSERT INTO messages(conversation_id, role, content)
-            VALUES(?, ?, ?)
-            """,
-            (conversation_id, role, content),
-        )
-        # 更新会话最近活跃时间。
-        conn.execute(
-            """
-            UPDATE conversations
-            SET updated_at = CURRENT_TIMESTAMP
-            WHERE id = ?
-            """,
-            (conversation_id,),
-        )
-
-        # 若是用户首条消息，自动生成会话标题。
-        if role == "user":
-            row = conn.execute(
-                "SELECT title FROM conversations WHERE id = ?",
-                (conversation_id,),
-            ).fetchone()
-            title = (row["title"] if row else None) or ""
-            if not title.strip():
-                normalized = " ".join(content.split()).strip()
-                auto_title = normalized[:40] if normalized else f"会话 #{conversation_id}"
-                conn.execute(
-                    "UPDATE conversations SET title = ? WHERE id = ?",
-                    (auto_title, conversation_id),
-                )
-
-
-def list_conversations() -> list[dict[str, Any]]:
-    """返回会话列表，并附带最后一条消息摘要。"""
-    with get_conn() as conn:
-        rows = conn.execute(
-            """
-            SELECT
-                c.id,
-                c.title,
-                c.created_at,
-                c.updated_at,
-                (
-                    SELECT m.content
-                    FROM messages m
-                    WHERE m.conversation_id = c.id
-                    ORDER BY m.id DESC
-                    LIMIT 1
-                ) AS last_message,
-                (
-                    SELECT m.created_at
-                    FROM messages m
-                    WHERE m.conversation_id = c.id
-                    ORDER BY m.id DESC
-                    LIMIT 1
-                ) AS last_message_at
-            FROM conversations c
-            ORDER BY COALESCE(last_message_at, c.updated_at, c.created_at) DESC, c.id DESC
-            """
-        ).fetchall()
-    return [dict(row) for row in rows]
 
 
 @app.on_event("startup")
 def on_startup() -> None:
-    """服务启动时初始化数据库。"""
+    """应用启动时初始化数据库。"""
+    # 启动即建表，避免首次请求才初始化。
     init_db()
-    # clear_db()
 
 
 @app.get("/")
 def home():
-    """基础健康检查接口。"""
+    """健康检查接口。"""
     return {"msg": "hello ai"}
 
 
 @app.post("/conversations")
 def new_conversation():
     """新建空会话。"""
+    # 仅创建会话，不写入消息。
     conversation_id = create_conversation()
     return {"conversation_id": conversation_id, "messages": []}
 
 
 @app.get("/conversations")
 def conversations():
-    """返回侧边栏所需会话列表。"""
+    """返回会话列表。"""
+    # 侧边栏依赖该接口展示最近会话。
     return {"conversations": list_conversations()}
 
 
 @app.get("/conversations/latest")
 def latest_conversation():
-    """返回最新会话；若不存在则自动创建。"""
+    """获取最新会话；不存在时自动创建。"""
     with get_conn() as conn:
+        # 直接读取最大 id 的会话。
         row = conn.execute(
             """
             SELECT id
@@ -391,8 +252,8 @@ def latest_conversation():
             """
         ).fetchone()
 
-    # 优先使用最新会话，否则新建默认会话。
     if row is None:
+        # 首次使用时创建默认会话。
         conversation_id = create_conversation()
     else:
         conversation_id = int(row["id"])
@@ -405,7 +266,7 @@ def latest_conversation():
 
 @app.get("/conversations/{conversation_id}/messages")
 def conversation_messages(conversation_id: int):
-    """查询指定会话的完整消息。"""
+    """查询指定会话完整消息。"""
     if not conversation_exists(conversation_id):
         raise HTTPException(status_code=404, detail="conversation not found")
     return {"conversation_id": conversation_id, "messages": get_messages(conversation_id)}
@@ -416,70 +277,78 @@ def remove_conversation(conversation_id: int):
     """删除指定会话。"""
     if not conversation_exists(conversation_id):
         raise HTTPException(status_code=404, detail="conversation not found")
+    # 删除会话会级联删除其消息（由业务函数完成）。
     delete_conversation(conversation_id)
     return {"deleted": True, "conversation_id": conversation_id}
 
 
 @app.post("/chat/stream")
 async def chat_stream(payload: ChatRequest, request: Request):
-    """处理用户消息并以 SSE 流式返回助手回复。"""
+    """流式聊天接口，使用 SSE 返回增量结果。"""
     conversation_id = payload.conversation_id
     continue_from_last = bool(payload.continue_from_last)
 
-    # 解析目标会话（无会话则新建）。
+    # 解析会话目标：无会话则新建；有会话但不存在则报错。
     if conversation_id is None:
         conversation_id = create_conversation()
     elif not conversation_exists(conversation_id):
         raise HTTPException(status_code=404, detail="conversation not found")
 
-    # 优先使用 content；兼容旧版 messages 字段。
+    # 优先读取 content；兼容旧版 messages 结构。
     content = (payload.content or "").strip()
     if not content and payload.messages:
         user_messages = [m for m in payload.messages if m.get("role") == "user"]
         if user_messages:
             content = str(user_messages[-1].get("content", "")).strip()
 
+    # 校验普通提问与续写提问的输入约束。
     if continue_from_last and content:
         raise HTTPException(status_code=400, detail="continue request should not include content")
     if not continue_from_last and not content:
         raise HTTPException(status_code=400, detail="empty message")
 
-    # 普通提问保存用户消息；续写请求不入库，仅作为临时指令拼接到上下文。
+    # 普通提问先写入用户消息；续写请求不写入数据库。
     if not continue_from_last:
         save_message(conversation_id, "user", content)
 
-    # 组装历史上下文发送给模型。
+    # 解析系统提示词：自定义优先，其次预设。
     system_prompt = (payload.system_prompt or "").strip()
     if not system_prompt:
         preset = (payload.system_prompt_preset or "").strip()
         if preset:
             system_prompt = SYSTEM_PROMPT_PRESETS.get(preset, "")
+
+    # 统一追加 Markdown 输出约束。
     if system_prompt:
         system_prompt = f"{system_prompt}\n\n{MARKDOWN_OUTPUT_INSTRUCTION}"
     else:
         system_prompt = MARKDOWN_OUTPUT_INSTRUCTION
-    history = [
-        {"role": item["role"], "content": item["content"]}
-        for item in get_messages(conversation_id)
-    ]
+
+    # 读取历史消息并构建模型上下文。
+    history = [{"role": item["role"], "content": item["content"]} for item in get_messages(conversation_id)]
     if continue_from_last:
         if not history or history[-1]["role"] != "assistant":
             raise HTTPException(status_code=400, detail="no assistant message to continue")
+        # 续写通过追加一条用户指令触发模型继续输出。
         history.append({"role": "user", "content": CONTINUATION_PROMPT})
     history, reserved_output_tokens = build_context_messages(history, system_prompt=system_prompt)
 
     async def event_stream():
+        """SSE 事件生成器。"""
         answer_parts: list[str] = []
         stream = None
         finish_reason: str | None = None
         try:
+            # 发起流式请求。
             stream = client.chat.completions.create(
                 model="deepseek-chat",
                 messages=history,
                 max_tokens=reserved_output_tokens,
                 stream=True,
             )
+
             for chunk in stream:
+                # 客户端断开后立即结束，避免无效计算。
                 if await request.is_disconnected():
                     break
                 if not chunk.choices:
@@ -487,31 +356,33 @@ async def chat_stream(payload: ChatRequest, request: Request):
                 choice = chunk.choices[0]
                 if choice.finish_reason:
                     finish_reason = str(choice.finish_reason)
+
                 delta = choice.delta.content
                 if not delta:
                     continue
+
+                # 累积增量文本，并把 delta 推送给前端。
                 answer_parts.append(delta)
                 yield f"data: {json.dumps({'type': 'delta', 'content': delta}, ensure_ascii=False)}\n\n"
 
+            # 流结束后清洗输出并入库。
             answer = unwrap_pseudo_markdown_fence("".join(answer_parts))
             if answer:
                 save_message(conversation_id, "assistant", answer)
+
+            # 正常结束时发送 done 事件。
             if not await request.is_disconnected():
                 truncated = finish_reason == "length"
-                yield (
-                    "data: "
-                    + json.dumps(
-                        {
-                            "type": "done",
-                            "conversation_id": conversation_id,
-                            "finish_reason": finish_reason,
-                            "truncated": truncated,
-                        },
-                        ensure_ascii=False,
-                    )
-                    + "\n\n"
-                )
+                payload_done = {
+                    "type": "done",
+                    "conversation_id": conversation_id,
+                    "finish_reason": finish_reason,
+                    "truncated": truncated,
+                }
+                yield f"data: {json.dumps(payload_done, ensure_ascii=False)}\n\n"
+
         except Exception as exc:
+            # 出错时尽量保留已生成内容，减少用户损失。
             if answer_parts:
                 partial_answer = unwrap_pseudo_markdown_fence("".join(answer_parts))
                 save_message(conversation_id, "assistant", partial_answer)
@@ -519,6 +390,7 @@ async def chat_stream(payload: ChatRequest, request: Request):
                 message = str(exc) or "stream failed"
                 yield f"data: {json.dumps({'type': 'error', 'message': message}, ensure_ascii=False)}\n\n"
         finally:
+            # 清理底层流资源，避免连接泄漏。
             close = getattr(stream, "close", None)
             if callable(close):
                 close()
@@ -527,8 +399,10 @@ async def chat_stream(payload: ChatRequest, request: Request):
         event_stream(),
         media_type="text/event-stream",
         headers={
+            # 禁止代理缓存，保证流式实时性。
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
         },
     )
+
