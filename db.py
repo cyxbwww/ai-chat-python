@@ -42,6 +42,40 @@ def init_db() -> None:
             )
             """
         )
+        # RAG 文档表：记录上传文档元信息。
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS documents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_name TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                file_ext TEXT,
+                file_size INTEGER DEFAULT 0,
+                file_hash TEXT,
+                status TEXT NOT NULL DEFAULT 'uploaded',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        # RAG 文本块表：记录文档切分后的 chunk。
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS document_chunks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                document_id INTEGER NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                token_count INTEGER DEFAULT 0,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE,
+                UNIQUE(document_id, chunk_index)
+            )
+            """
+        )
+        # 常用查询索引，提升后续检索效率。
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_documents_status ON documents(status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_document_chunks_document_id ON document_chunks(document_id)")
 
 
 def clear_db() -> None:
@@ -50,8 +84,11 @@ def clear_db() -> None:
         # 先删子表，再删主表。
         conn.execute("DELETE FROM messages")
         conn.execute("DELETE FROM conversations")
+        conn.execute("DELETE FROM document_chunks")
+        conn.execute("DELETE FROM documents")
         # 同步重置 SQLite 自增计数。
         conn.execute("DELETE FROM sqlite_sequence WHERE name IN ('messages', 'conversations')")
+        conn.execute("DELETE FROM sqlite_sequence WHERE name IN ('documents', 'document_chunks')")
 
 
 def create_conversation(title: str | None = None) -> int:
@@ -156,3 +193,125 @@ def list_conversations() -> list[dict[str, Any]]:
         ).fetchall()
     return [dict(row) for row in rows]
 
+
+def create_document(
+    *,
+    file_name: str,
+    file_path: str,
+    file_ext: str | None,
+    file_size: int,
+    file_hash: str | None,
+    status: str = "uploaded",
+) -> int:
+    """写入文档记录并返回文档 ID。"""
+    with get_conn() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO documents(file_name, file_path, file_ext, file_size, file_hash, status, updated_at)
+            VALUES(?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            """,
+            (file_name, file_path, file_ext, file_size, file_hash, status),
+        )
+        return int(cur.lastrowid)
+
+
+def get_document(document_id: int) -> dict[str, Any] | None:
+    """读取单个文档记录。"""
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM documents WHERE id = ?", (document_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def list_documents(limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
+    """分页读取文档列表。"""
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT d.*,
+                   (SELECT COUNT(*) FROM document_chunks c WHERE c.document_id = d.id) AS chunk_count
+            FROM documents d
+            ORDER BY d.id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (limit, offset),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def update_document_status(document_id: int, status: str) -> None:
+    """更新文档状态。"""
+    with get_conn() as conn:
+        conn.execute(
+            """
+            UPDATE documents
+            SET status = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (status, document_id),
+        )
+
+
+def replace_document_chunks(document_id: int, chunks: list[str], token_chars_estimate: int = 2) -> int:
+    """重建某个文档的全部文本块。"""
+    chars_per_token = max(1, token_chars_estimate)
+    with get_conn() as conn:
+        conn.execute("DELETE FROM document_chunks WHERE document_id = ?", (document_id,))
+        for idx, content in enumerate(chunks):
+            text = (content or "").strip()
+            if not text:
+                continue
+            token_count = max(1, (len(text) + chars_per_token - 1) // chars_per_token)
+            conn.execute(
+                """
+                INSERT INTO document_chunks(document_id, chunk_index, content, token_count)
+                VALUES(?, ?, ?, ?)
+                """,
+                (document_id, idx, text, token_count),
+            )
+        row = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM document_chunks WHERE document_id = ?",
+            (document_id,),
+        ).fetchone()
+        return int(row["cnt"]) if row else 0
+
+
+def list_chunks_for_faiss() -> list[dict[str, Any]]:
+    """读取构建向量索引所需的全部 chunk。"""
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                c.id AS chunk_id,
+                c.document_id,
+                c.chunk_index,
+                c.content,
+                d.file_name
+            FROM document_chunks c
+            JOIN documents d ON d.id = c.document_id
+            ORDER BY c.document_id ASC, c.chunk_index ASC
+            """
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def search_document_chunks_like(query: str, top_k: int = 5) -> list[dict[str, Any]]:
+    """按 LIKE 执行兜底检索。"""
+    keyword = f"%{(query or '').strip()}%"
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                c.id AS chunk_id,
+                c.document_id,
+                c.chunk_index,
+                c.content,
+                d.file_name
+            FROM document_chunks c
+            JOIN documents d ON d.id = c.document_id
+            WHERE c.content LIKE ?
+            ORDER BY c.document_id DESC, c.chunk_index ASC
+            LIMIT ?
+            """,
+            (keyword, max(1, top_k)),
+        ).fetchall()
+    return [dict(row) for row in rows]

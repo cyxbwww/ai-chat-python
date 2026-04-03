@@ -18,3 +18,7 @@ class ChatRequest(BaseModel):
     system_prompt_preset: str | None = None
     # 是否从上一条 assistant 回复继续续写。
     continue_from_last: bool = False
+    # 是否启用 RAG 检索增强。
+    rag_enabled: bool = False
+    # RAG 检索 top_k。
+    rag_top_k: int = 4

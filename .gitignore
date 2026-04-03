@@ -31,5 +31,9 @@ Thumbs.db
 *.sqlite3
 *.db
 
+# 本地文件
+faiss/
+uploads/
+
 # 依赖
 node_modules/
